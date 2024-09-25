@@ -19,9 +19,13 @@ class DownloadStream:
 
     async def fetch_file_size(self):
         async with aiohttp.ClientSession() as session:
-            async with session.head(self.url) as response:
-                response.raise_for_status()  # Verificar si la respuesta es exitosa
-                self.file_size = int(response.headers.get("Content-Length", 0))
+            try:
+                async with session.head(self.url) as response:
+                    response.raise_for_status()  # Verificar si la respuesta es exitosa
+                    self.file_size = int(response.headers.get("Content-Length", 0))
+            except Exception as e:
+                logger.error(f"Error fetching file size for {self.url}: {e}")
+                raise  # Propagar la excepción para que el flujo de trabajo la maneje
         return self.file_size
 
     def __len__(self):
@@ -138,12 +142,8 @@ class DownloadPool:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     urls = [
-        "https://www.deezer.com/mx/track/123456789",  # Reemplazar con enlaces válidos de Deezer
-        "https://www.deezer.com/mx/track/987654321",
+        "https://www.deezer.com/mx/playlist/13111970783?host=6269534483&deferredFl=1",  # Reemplazar con enlaces válidos de Deezer
         # Agregar más URLs aquí
     ]
     with DownloadPool(urls) as pool:
         pool.download()
-
-
-
