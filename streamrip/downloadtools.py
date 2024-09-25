@@ -23,16 +23,21 @@ class DownloadStream:
                 self.file_size = int(response.headers.get("Content-Length", 0))
         return self.file_size
 
+    def __len__(self):
+        if self.file_size is not None:
+            return self.file_size
+        raise ValueError("File size not available. Call fetch_file_size() first.")
+
 class DownloadPool:
     """Asynchronously download a set of urls with advanced strategies."""
 
-    def __init__(self, urls: Iterable, max_connections: int = 800, tempdir: str = None):
+    def __init__(self, urls: Iterable, max_connections: int = 200, tempdir: str = None):
         self.urls = dict(enumerate(urls))
         self._paths: Dict[str, str] = {}
         self.semaphore = asyncio.Semaphore(max_connections)
         self.tempdir = tempdir or gettempdir()
         self.retry_limit = 5  # Límite de reintentos
-        self.chunk_size = 99999999  # Tamaño de chunk ajustable
+        self.chunk_size = 8192  # Tamaño de chunk ajustable
 
     async def get_file_path(self, url):
         path = os.path.join(self.tempdir, f"__streamrip_partial_{abs(hash(url))}")
@@ -56,7 +61,7 @@ class DownloadPool:
     async def _download_file(self, session, url):
         """Download file using range requests."""
         file_stream = DownloadStream(url)
-        await file_stream.fetch_file_size()
+        await file_stream.fetch_file_size()  # Fetch file size before downloading
         file_size = file_stream.file_size
         part_size = file_size // 8
 
@@ -138,4 +143,5 @@ if __name__ == "__main__":
     ]
     with DownloadPool(urls) as pool:
         pool.download()
+
 
