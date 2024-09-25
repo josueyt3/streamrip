@@ -29,13 +29,13 @@ class DownloadStream:
 class DownloadPool:
     """Asynchronously download a set of urls with advanced strategies."""
 
-    def __init__(self, urls: Iterable, max_connections: int = 200, tempdir: str = None):
+    def __init__(self, urls: Iterable, max_connections: int = 600, tempdir: str = None):
         self.urls = dict(enumerate(urls))
         self._paths: Dict[str, str] = {}
         self.semaphore = asyncio.Semaphore(max_connections)
         self.tempdir = tempdir or gettempdir()
         self.retry_limit = 5  # Límite de reintentos
-        self.chunk_size = 8192  # Tamaño de chunk ajustable
+        self.chunk_size = 999999999  # Tamaño de chunk ajustable
 
     async def get_file_path(self, url):
         path = os.path.join(self.tempdir, f"__streamrip_partial_{abs(hash(url))}")
