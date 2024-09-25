@@ -59,7 +59,7 @@ class DownloadStream:
         if self.source == "deezer" and self.is_encrypted.search(self.url) is not None:
             assert isinstance(self.id, str), self.id
             blowfish_key = self._generate_blowfish_key(self.id)
-            CHUNK_SIZE = 999999  # Tamaño de chunk aumentado
+            CHUNK_SIZE = 8090 # Tamaño de chunk aumentado
             return (
                 (self._decrypt_chunk(blowfish_key, chunk[:2048]) + chunk[2048:])
                 if len(chunk) >= 2048
@@ -67,7 +67,7 @@ class DownloadStream:
                 for chunk in self.request.iter_content(CHUNK_SIZE)
             )
 
-        return self.request.iter_content(chunk_size=999999)  # Aumentar tamaño de chunk
+        return self.request.iter_content(chunk_size=9934)  # Aumentar tamaño de chunk
 
     @property
     def url(self):
@@ -100,7 +100,7 @@ class DownloadPool:
     def __init__(
         self,
         urls: Iterable,
-        max_connections: int = 800,  # Número máximo de conexiones
+        max_connections: int = 600,  # Número máximo de conexiones
         tempdir: str = None,
         chunk_callback: Optional[Callable] = None,
     ):
@@ -139,7 +139,7 @@ class DownloadPool:
                         response.raise_for_status()  # Verificar errores de respuesta
                         async with aiofiles.open(filename, "wb") as f:
                             while True:
-                                chunk = await response.content.read(999999)  # Tamaño de chunk aumentado
+                                chunk = await response.content.read(80904)  # Tamaño de chunk aumentado
                                 if not chunk:
                                     break
                                 await f.write(chunk)
