@@ -2,7 +2,7 @@ import asyncio
 import os
 import logging
 from tempfile import gettempdir
-from typing import Iterable, List, Optional
+from typing import Iterable, Dict
 
 import aiofiles
 import aiohttp
@@ -14,28 +14,25 @@ class DownloadStream:
 
     def __init__(self, url: str, headers: dict = None):
         self.url = url
-        self.session = aiohttp.ClientSession(headers=headers)
+        self.headers = headers
         self.file_size = None
 
     async def fetch_file_size(self):
-        async with self.session.head(self.url) as response:
-            self.file_size = int(response.headers.get("Content-Length", 0))
+        async with aiohttp.ClientSession() as session:
+            async with session.head(self.url) as response:
+                self.file_size = int(response.headers.get("Content-Length", 0))
         return self.file_size
-
-    async def close(self):
-        await self.session.close()
-
 
 class DownloadPool:
     """Asynchronously download a set of urls with advanced strategies."""
 
-    def __init__(self, urls: Iterable, max_connections: int = 600, tempdir: str = None):
+    def __init__(self, urls: Iterable, max_connections: int = 800, tempdir: str = None):
         self.urls = dict(enumerate(urls))
         self._paths: Dict[str, str] = {}
         self.semaphore = asyncio.Semaphore(max_connections)
         self.tempdir = tempdir or gettempdir()
         self.retry_limit = 5  # Límite de reintentos
-        self.chunk_size = 999999999  # Tamaño de chunk ajustable
+        self.chunk_size = 99999999  # Tamaño de chunk ajustable
 
     async def get_file_path(self, url):
         path = os.path.join(self.tempdir, f"__streamrip_partial_{abs(hash(url))}")
@@ -131,7 +128,7 @@ class DownloadPool:
                 pass
         return False
 
-# Example Usage
+# Ejemplo de uso
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     urls = [
@@ -141,5 +138,4 @@ if __name__ == "__main__":
     ]
     with DownloadPool(urls) as pool:
         pool.download()
-
 
