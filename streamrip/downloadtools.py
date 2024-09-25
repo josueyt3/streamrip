@@ -18,16 +18,7 @@ logger = logging.getLogger("streamrip")
 
 
 class DownloadStream:
-    """An iterator over chunks of a stream.
-
-    Usage:
-
-        >>> stream = DownloadStream('https://google.com', None)
-        >>> with open('google.html', 'wb') as file:
-        >>>     for chunk in stream:
-        >>>         file.write(chunk)
-
-    """
+    """An iterator over chunks of a stream."""
 
     is_encrypted = re.compile("/m(?:obile|edia)/")
 
@@ -39,19 +30,6 @@ class DownloadStream:
         headers: dict = None,
         item_id: str = None,
     ):
-        """Create an iterable DownloadStream of a URL.
-
-        :param url: The url to download
-        :type url: str
-        :param source: Only applicable for Deezer
-        :type source: str
-        :param params: Parameters to pass in the request
-        :type params: dict
-        :param headers: Headers to pass in the request
-        :type headers: dict
-        :param item_id: (Only for Deezer) the ID of the track
-        :type item_id: str
-        """
         self.source = source
         self.session = gen_threadsafe_session(headers=headers)
 
@@ -72,61 +50,36 @@ class DownloadStream:
 
             try:
                 info = self.request.json()
-                try:
-                    # Usually happens with deezloader downloads
-                    raise NonStreamable(f"{info['error']} - {info['message']}")
-                except KeyError:
-                    raise NonStreamable(info)
+                raise NonStreamable(f"{info['error']} - {info['message']}")
 
             except json.JSONDecodeError:
                 raise NonStreamable("File not found.")
 
     def __iter__(self) -> Iterable:
-        """Iterate through chunks of the stream.
-
-        :rtype: Iterable
-        """
         if self.source == "deezer" and self.is_encrypted.search(self.url) is not None:
             assert isinstance(self.id, str), self.id
-
             blowfish_key = self._generate_blowfish_key(self.id)
-            # decryptor = self._create_deezer_decryptor(blowfish_key)
-            CHUNK_SIZE = 2048 * 3
+            CHUNK_SIZE = 4096  # Tamaño de chunk aumentado
             return (
-                # (decryptor.decrypt(chunk[:2048]) + chunk[2048:])
                 (self._decrypt_chunk(blowfish_key, chunk[:2048]) + chunk[2048:])
                 if len(chunk) >= 2048
                 else chunk
                 for chunk in self.request.iter_content(CHUNK_SIZE)
             )
 
-        return self.request.iter_content(chunk_size=1024)
+        return self.request.iter_content(chunk_size=999999)  # Aumentar tamaño de chunk
 
     @property
     def url(self):
-        """Return the requested url."""
         return self.request.url
 
     def __len__(self) -> int:
-        """Return the value of the "Content-Length" header.
-
-        :rtype: int
-        """
         return self.file_size
-
-    def _create_deezer_decryptor(self, key) -> Blowfish:
-        return Blowfish.new(key, Blowfish.MODE_CBC, b"\x00\x01\x02\x03\x04\x05\x06\x07")
 
     @staticmethod
     def _generate_blowfish_key(track_id: str):
-        """Generate the blowfish key for Deezer downloads.
-
-        :param track_id:
-        :type track_id: str
-        """
         SECRET = "g4el58wc0zvf9na1"
         md5_hash = hashlib.md5(track_id.encode()).hexdigest()
-        # good luck :)
         return "".join(
             chr(functools.reduce(lambda x, y: x ^ y, map(ord, t)))
             for t in zip(md5_hash[:16], md5_hash[16:], SECRET)
@@ -134,11 +87,6 @@ class DownloadStream:
 
     @staticmethod
     def _decrypt_chunk(key, data):
-        """Decrypt a chunk of a Deezer stream.
-
-        :param key:
-        :param data:
-        """
         return Blowfish.new(
             key,
             Blowfish.MODE_CBC,
@@ -152,16 +100,16 @@ class DownloadPool:
     def __init__(
         self,
         urls: Iterable,
+        max_connections: int = 100,  # Número máximo de conexiones
         tempdir: str = None,
         chunk_callback: Optional[Callable] = None,
     ):
         self.finished: bool = False
-        # Enumerate urls to know the order
         self.urls = dict(enumerate(urls))
         self._downloaded_urls: List[str] = []
-        # {url: path}
         self._paths: Dict[str, str] = {}
         self.task: Optional[asyncio.Task] = None
+        self.semaphore = asyncio.Semaphore(max_connections)  # Límite de conexiones
 
         if tempdir is None:
             tempdir = gettempdir()
@@ -181,15 +129,25 @@ class DownloadPool:
             await asyncio.gather(*tasks)
 
     async def _download_url(self, session, url):
-        filename = await self.getfn(url)
-        logger.debug("Downloading %s", url)
-        async with session.get(url) as response, aiofiles.open(filename, "wb") as f:
-            # without aiofiles     3.6632679780000004s
-            # with    aiofiles     2.504482839s
-            await f.write(await response.content.read())
-
-        if self.callback:
-            self.callback()
+        async with self.semaphore:  # Limitar conexiones simultáneas
+            filename = await self.getfn(url)
+            logger.debug("Downloading %s", url)
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    async with session.get(url) as response:
+                        response.raise_for_status()  # Verificar errores de respuesta
+                        async with aiofiles.open(filename, "wb") as f:
+                            while True:
+                                chunk = await response.content.read(8192)  # Tamaño de chunk aumentado
+                                if not chunk:
+                                    break
+                                await f.write(chunk)
+                    break  # Salir del bucle si la descarga es exitosa
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1}/{retries} failed for {url}: {e}")
+                    if attempt == retries - 1:
+                        logger.error(f"Failed to download {url} after {retries} attempts.")
 
         logger.debug("Finished %s", url)
 
@@ -200,7 +158,6 @@ class DownloadPool:
     @property
     def files(self):
         if len(self._paths) != len(self.urls):
-            # Not all of them have downloaded
             raise Exception("Must run DownloadPool.download() before accessing files")
 
         return [
@@ -223,3 +180,4 @@ class DownloadPool:
                 pass
 
         return False
+
