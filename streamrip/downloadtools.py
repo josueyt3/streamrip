@@ -20,6 +20,7 @@ class DownloadStream:
     async def fetch_file_size(self):
         async with aiohttp.ClientSession() as session:
             async with session.head(self.url) as response:
+                response.raise_for_status()  # Verificar si la respuesta es exitosa
                 self.file_size = int(response.headers.get("Content-Length", 0))
         return self.file_size
 
@@ -62,7 +63,7 @@ class DownloadPool:
         """Download file using range requests."""
         file_stream = DownloadStream(url)
         await file_stream.fetch_file_size()  # Fetch file size before downloading
-        file_size = file_stream.file_size
+        file_size = len(file_stream)  # Ahora podemos acceder al tamaño
         part_size = file_size // 8
 
         tasks = []
@@ -143,5 +144,6 @@ if __name__ == "__main__":
     ]
     with DownloadPool(urls) as pool:
         pool.download()
+
 
 
