@@ -67,8 +67,8 @@ class DownloadPool:
         """Download file using range requests."""
         file_stream = DownloadStream(url)
         await file_stream.fetch_file_size()  # Fetch file size before downloading
-        file_size = len(file_stream)  # Ahora podemos acceder al tamaño
-        part_size = file_size // 8
+        file_size = file_stream.file_size
+        part_size = max(file_size // 8, 1)  # Asegurarse de que part_size sea al menos 1
 
         tasks = []
         for part in range(8):
@@ -82,7 +82,7 @@ class DownloadPool:
     async def _download_part(self, session, url, start, end, part_number):
         """Download a part of the file with integrity check."""
         headers = {"Range": f"bytes={start}-{end}"}
-        part_filename = f"{url.replace('/', '_')}.part{part_number}"
+        part_filename = os.path.join(self.tempdir, f"{url.replace('/', '_')}.part{part_number}")
         
         async with self.semaphore:
             logger.debug(f"Downloading part {part_number} from {start} to {end} for {url}")
@@ -101,7 +101,7 @@ class DownloadPool:
         final_filename = await self.get_file_path(file_stream.url)
         with open(final_filename, "wb") as outfile:
             for part in range(1, num_parts + 1):
-                part_filename = f"{file_stream.url.replace('/', '_')}.part{part}"
+                part_filename = os.path.join(self.tempdir, f"{file_stream.url.replace('/', '_')}.part{part}")
                 with open(part_filename, "rb") as infile:
                     outfile.write(infile.read())
                 os.remove(part_filename)
@@ -142,7 +142,8 @@ class DownloadPool:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     urls = [
-        "https://www.deezer.com/mx/playlist/13111970783?host=6269534483&deferredFl=1",  # Reemplazar con enlaces válidos de Deezer
+        "https://www.deezer.com/mx/track/123456789",  # Reemplazar con enlaces válidos de Deezer
+        "https://www.deezer.com/mx/track/987654321",
         # Agregar más URLs aquí
     ]
     with DownloadPool(urls) as pool:
