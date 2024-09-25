@@ -1,127 +1,169 @@
 import asyncio
-import os
+import functools
+import hashlib
 import logging
+import os
+import re
 from tempfile import gettempdir
-from typing import Iterable, Dict
+from typing import Callable, Dict, Iterable, List, Optional
 
 import aiofiles
 import aiohttp
+from Cryptodome.Cipher import Blowfish
+
+from .exceptions import NonStreamable
+from .utils import gen_threadsafe_session
 
 logger = logging.getLogger("streamrip")
+
 
 class DownloadStream:
     """An iterator over chunks of a stream."""
 
-    def __init__(self, url: str, headers: dict = None):
-        self.url = url
-        self.headers = headers
-        self.file_size = None
+    is_encrypted = re.compile("/m(?:obile|edia)/")
 
-    async def fetch_file_size(self):
-        async with aiohttp.ClientSession() as session:
+    def __init__(
+        self,
+        url: str,
+        source: str = None,
+        params: dict = None,
+        headers: dict = None,
+        item_id: str = None,
+    ):
+        self.source = source
+        self.session = gen_threadsafe_session(headers=headers)
+
+        self.id = item_id
+        if isinstance(self.id, int):
+            self.id = str(self.id)
+
+        if params is None:
+            params = {}
+
+        self.request = self.session.get(
+            url, allow_redirects=True, stream=True, params=params
+        )
+        self.file_size = int(self.request.headers.get("Content-Length", 0))
+
+        if self.file_size < 20000 and not self.url.endswith(".jpg"):
+            import json
+
             try:
-                async with session.head(self.url) as response:
-                    response.raise_for_status()  # Verificar si la respuesta es exitosa
-                    self.file_size = int(response.headers.get("Content-Length", 0))
-            except Exception as e:
-                logger.error(f"Error fetching file size for {self.url}: {e}")
-                raise  # Propagar la excepción para que el flujo de trabajo la maneje
+                info = self.request.json()
+                raise NonStreamable(f"{info['error']} - {info['message']}")
+
+            except json.JSONDecodeError:
+                raise NonStreamable("File not found.")
+
+    def __iter__(self) -> Iterable:
+        if self.source == "deezer" and self.is_encrypted.search(self.url) is not None:
+            assert isinstance(self.id, str), self.id
+            blowfish_key = self._generate_blowfish_key(self.id)
+            CHUNK_SIZE = 999999  # Tamaño de chunk aumentado
+            return (
+                (self._decrypt_chunk(blowfish_key, chunk[:2048]) + chunk[2048:])
+                if len(chunk) >= 2048
+                else chunk
+                for chunk in self.request.iter_content(CHUNK_SIZE)
+            )
+
+        return self.request.iter_content(chunk_size=999999)  # Aumentar tamaño de chunk
+
+    @property
+    def url(self):
+        return self.request.url
+
+    def __len__(self) -> int:
         return self.file_size
 
-    def __len__(self):
-        if self.file_size is not None:
-            return self.file_size
-        raise ValueError("File size not available. Call fetch_file_size() first.")
+    @staticmethod
+    def _generate_blowfish_key(track_id: str):
+        SECRET = "g4el58wc0zvf9na1"
+        md5_hash = hashlib.md5(track_id.encode()).hexdigest()
+        return "".join(
+            chr(functools.reduce(lambda x, y: x ^ y, map(ord, t)))
+            for t in zip(md5_hash[:16], md5_hash[16:], SECRET)
+        ).encode()
+
+    @staticmethod
+    def _decrypt_chunk(key, data):
+        return Blowfish.new(
+            key,
+            Blowfish.MODE_CBC,
+            b"\x00\x01\x02\x03\x04\x05\x06\x07",
+        ).decrypt(data)
+
 
 class DownloadPool:
-    """Asynchronously download a set of urls with advanced strategies."""
+    """Asynchronously download a set of urls."""
 
-    def __init__(self, urls: Iterable, max_connections: int = 200, tempdir: str = None):
+    def __init__(
+        self,
+        urls: Iterable,
+        max_connections: int = 800,  # Número máximo de conexiones
+        tempdir: str = None,
+        chunk_callback: Optional[Callable] = None,
+    ):
+        self.finished: bool = False
         self.urls = dict(enumerate(urls))
+        self._downloaded_urls: List[str] = []
         self._paths: Dict[str, str] = {}
-        self.semaphore = asyncio.Semaphore(max_connections)
-        self.tempdir = tempdir or gettempdir()
-        self.retry_limit = 5  # Límite de reintentos
-        self.chunk_size = 8192  # Tamaño de chunk ajustable
+        self.task: Optional[asyncio.Task] = None
+        self.semaphore = asyncio.Semaphore(max_connections)  # Límite de conexiones
 
-    async def get_file_path(self, url):
+        if tempdir is None:
+            tempdir = gettempdir()
+        self.tempdir = tempdir
+
+    async def getfn(self, url):
         path = os.path.join(self.tempdir, f"__streamrip_partial_{abs(hash(url))}")
         self._paths[url] = path
         return path
 
-    async def _download_with_retries(self, session, url):
-        """Download file with retry logic."""
-        retries = 0
-        while retries < self.retry_limit:
-            try:
-                await self._download_file(session, url)
-                break  # Salir si la descarga fue exitosa
-            except Exception as e:
-                retries += 1
-                logger.warning(f"Error downloading {url}: {e}. Retrying {retries}/{self.retry_limit}...")
-                await asyncio.sleep(2 ** retries)  # Esperar un tiempo exponencial antes de reintentar
-        else:
-            logger.error(f"Failed to download {url} after {self.retry_limit} attempts.")
-
-    async def _download_file(self, session, url):
-        """Download file using range requests."""
-        file_stream = DownloadStream(url)
-        await file_stream.fetch_file_size()  # Fetch file size before downloading
-        file_size = file_stream.file_size
-        part_size = max(file_size // 8, 1)  # Asegurarse de que part_size sea al menos 1
-
-        tasks = []
-        for part in range(8):
-            start = part * part_size
-            end = start + part_size - 1 if part < 7 else file_size - 1
-            tasks.append(self._download_part(session, url, start, end, part + 1))
-
-        await asyncio.gather(*tasks)
-        await self._combine_files(file_stream, 8)
-
-    async def _download_part(self, session, url, start, end, part_number):
-        """Download a part of the file with integrity check."""
-        headers = {"Range": f"bytes={start}-{end}"}
-        part_filename = os.path.join(self.tempdir, f"{url.replace('/', '_')}.part{part_number}")
-        
-        async with self.semaphore:
-            logger.debug(f"Downloading part {part_number} from {start} to {end} for {url}")
-            async with session.get(url, headers=headers) as response:
-                response.raise_for_status()
-                async with aiofiles.open(part_filename, "wb") as f:
-                    while True:
-                        chunk = await response.content.read(self.chunk_size)
-                        if not chunk:
-                            break
-                        await f.write(chunk)
-            logger.info(f"Finished downloading part {part_number} for {url}")
-
-    async def _combine_files(self, file_stream, num_parts):
-        """Combine the parts into the final file."""
-        final_filename = await self.get_file_path(file_stream.url)
-        with open(final_filename, "wb") as outfile:
-            for part in range(1, num_parts + 1):
-                part_filename = os.path.join(self.tempdir, f"{file_stream.url.replace('/', '_')}.part{part}")
-                with open(part_filename, "rb") as infile:
-                    outfile.write(infile.read())
-                os.remove(part_filename)
-        logger.info(f"Combined file saved as {final_filename}")
-
-    async def download_all(self):
-        """Download all URLs with concurrent downloads."""
+    async def _download_urls(self):
         async with aiohttp.ClientSession() as session:
-            tasks = [self._download_with_retries(session, url) for url in self.urls.values()]
+            tasks = [
+                asyncio.ensure_future(self._download_url(session, url))
+                for url in self.urls.values()
+            ]
             await asyncio.gather(*tasks)
 
-    def download(self):
-        """Run the download process."""
-        asyncio.run(self.download_all())
+    async def _download_url(self, session, url):
+        async with self.semaphore:  # Limitar conexiones simultáneas
+            filename = await self.getfn(url)
+            logger.debug("Downloading %s", url)
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    async with session.get(url) as response:
+                        response.raise_for_status()  # Verificar errores de respuesta
+                        async with aiofiles.open(filename, "wb") as f:
+                            while True:
+                                chunk = await response.content.read(999999)  # Tamaño de chunk aumentado
+                                if not chunk:
+                                    break
+                                await f.write(chunk)
+                    break  # Salir del bucle si la descarga es exitosa
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1}/{retries} failed for {url}: {e}")
+                    if attempt == retries - 1:
+                        logger.error(f"Failed to download {url} after {retries} attempts.")
+
+        logger.debug("Finished %s", url)
+
+    def download(self, callback=None):
+        self.callback = callback
+        asyncio.run(self._download_urls())
 
     @property
     def files(self):
         if len(self._paths) != len(self.urls):
             raise Exception("Must run DownloadPool.download() before accessing files")
-        return [self._paths[self.urls[i]] for i in range(len(self.urls))]
+
+        return [
+            os.path.join(self.tempdir, self._paths[self.urls[i]])
+            for i in range(len(self.urls))
+        ]
 
     def __len__(self):
         return len(self.urls)
@@ -130,21 +172,11 @@ class DownloadPool:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        logger.debug("Cleaning up temporary files: %s", self._paths)
+        logger.debug("Removing tempfiles %s", self._paths)
         for file in self._paths.values():
             try:
                 os.remove(file)
             except FileNotFoundError:
                 pass
-        return False
 
-# Ejemplo de uso
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    urls = [
-        "https://www.deezer.com/mx/track/123456789",  # Reemplazar con enlaces válidos de Deezer
-        "https://www.deezer.com/mx/track/987654321",
-        # Agregar más URLs aquí
-    ]
-    with DownloadPool(urls) as pool:
-        pool.download()
+        return False
