@@ -1,72 +1,172 @@
 import asyncio
+import functools
+import hashlib
 import logging
 import os
-import subprocess
+import re
 from tempfile import gettempdir
-from typing import Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
+import subprocess
+
+import aiofiles
+import aiohttp
+from Cryptodome.Cipher import Blowfish
+
+from .exceptions import NonStreamable
+from .utils import gen_threadsafe_session
 
 logger = logging.getLogger("streamrip")
 
-class Aria2DownloadPool:
-    """Manages asynchronous downloads using aria2c."""
+
+class DownloadStream:
+    """An iterator over chunks of a stream."""
+
+    is_encrypted = re.compile("/m(?:obile|edia)/")
+
+    def __init__(
+        self,
+        url: str,
+        source: str = None,
+        params: dict = None,
+        headers: dict = None,
+        item_id: str = None,
+    ):
+        self.source = source
+        self.session = gen_threadsafe_session(headers=headers)
+
+        self.id = item_id
+        if isinstance(self.id, int):
+            self.id = str(self.id)
+
+        if params is None:
+            params = {}
+
+        self.request = self.session.get(
+            url, allow_redirects=True, stream=True, params=params
+        )
+        self.file_size = int(self.request.headers.get("Content-Length", 0))
+
+        if self.file_size < 20000 and not self.url.endswith(".jpg"):
+            import json
+
+            try:
+                info = self.request.json()
+                raise NonStreamable(f"{info['error']} - {info['message']}")
+
+            except json.JSONDecodeError:
+                raise NonStreamable("File not found.")
+
+    def __iter__(self) -> Iterable:
+        if self.source == "deezer" and self.is_encrypted.search(self.url) is not None:
+            assert isinstance(self.id, str), self.id
+            blowfish_key = self._generate_blowfish_key(self.id)
+            CHUNK_SIZE = 8090  # Tamaño de chunk aumentado
+            return (
+                (self._decrypt_chunk(blowfish_key, chunk[:2048]) + chunk[2048:])
+                if len(chunk) >= 2048
+                else chunk
+                for chunk in self.request.iter_content(CHUNK_SIZE)
+            )
+
+        return self.request.iter_content(chunk_size=9934)  # Aumentar tamaño de chunk
+
+    @property
+    def url(self):
+        return self.request.url
+
+    def __len__(self) -> int:
+        return self.file_size
+
+    @staticmethod
+    def _generate_blowfish_key(track_id: str):
+        SECRET = "g4el58wc0zvf9na1"
+        md5_hash = hashlib.md5(track_id.encode()).hexdigest()
+        return "".join(
+            chr(functools.reduce(lambda x, y: x ^ y, map(ord, t)))
+            for t in zip(md5_hash[:16], md5_hash[16:], SECRET)
+        ).encode()
+
+    @staticmethod
+    def _decrypt_chunk(key, data):
+        return Blowfish.new(
+            key,
+            Blowfish.MODE_CBC,
+            b"\x00\x01\x02\x03\x04\x05\x06\x07",
+        ).decrypt(data)
+
+
+class DownloadPool:
+    """Asynchronously download a set of urls."""
 
     def __init__(
         self,
         urls: Iterable,
+        max_connections: int = 16,  # Limitar conexiones a un máximo de 16
         tempdir: str = None,
-        max_connections: int = 16,  # Máximo de conexiones por descarga
-        max_cpu: int = 4,  # Número de CPUs a utilizar
-        max_ram: int = 12 * 1024,  # RAM máxima en MB (12 GB)
-        download_speed_limit: Optional[str] = None,  # Limitar velocidad de descarga (ej. '1M' para 1MB/s)
-        split_size: int = 16,  # Número de fragmentos por archivo
+        chunk_callback: Optional[Callable] = None,
     ):
-        self.urls = list(urls)
-        self.tempdir = tempdir or gettempdir()
-        self.max_connections = max_connections
-        self.max_cpu = max_cpu
-        self.max_ram = max_ram
-        self.split_size = split_size
-        self.download_speed_limit = download_speed_limit
+        self.finished: bool = False
+        self.urls = dict(enumerate(urls))
+        self._downloaded_urls: List[str] = []
+        self._paths: Dict[str, str] = {}
+        self.task: Optional[asyncio.Task] = None
+        self.semaphore = asyncio.Semaphore(max_connections)  # Límite de conexiones
 
-    async def _download_url(self, url):
-        filename = os.path.join(self.tempdir, f"{abs(hash(url))}.part")
-        logger.debug(f"Downloading {url} to {filename}")
+        if tempdir is None:
+            tempdir = gettempdir()
+        self.tempdir = tempdir
 
-        # Construir el comando aria2c para descargar el archivo
-        command = [
-            "aria2c",
-            "--dir", self.tempdir,  # Directorio de descarga
-            "--out", os.path.basename(filename),  # Nombre del archivo
-            "--max-connection-per-server", str(self.max_connections),  # Conexiones por servidor
-            "--split", str(self.split_size),  # Fragmentación del archivo
-            "--enable-rpc=false",  # Deshabilitar RPC para mejor rendimiento
-            "--min-split-size", "1M",  # Mínimo tamaño de fragmento
-            "--file-allocation=trunc",  # Preasignar espacio para el archivo
-            "--max-overall-download-limit", f"{self.max_ram // 10}M",  # Límite de uso de RAM
-        ]
+        os.makedirs(self.tempdir, exist_ok=True)  # Asegúrate de que el directorio exista
 
-        if self.download_speed_limit:
-            command.extend(["--max-download-limit", self.download_speed_limit])
-
-        command.append(url)  # URL del archivo a descargar
-
-        # Ejecutar el comando aria2c
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if result.returncode != 0:
-            logger.error(f"Failed to download {url}: {result.stderr.decode()}")
-
-        logger.debug(f"Finished {url}")
+    async def getfn(self, url):
+        path = os.path.join(self.tempdir, f"__streamrip_partial_{abs(hash(url))}")
+        self._paths[url] = path
+        return path
 
     async def _download_urls(self):
-        tasks = [self._download_url(url) for url in self.urls]
-        await asyncio.gather(*tasks)
+        async with aiohttp.ClientSession() as session:
+            tasks = [
+                asyncio.ensure_future(self._download_url(session, url))
+                for url in self.urls.values()
+            ]
+            await asyncio.gather(*tasks)
 
-    def download(self):
+    async def _download_url(self, session, url):
+        async with self.semaphore:  # Limitar conexiones simultáneas
+            filename = await self.getfn(url)
+            logger.debug("Downloading %s", url)
+            retries = 3
+            for attempt in range(retries):
+                try:
+                    async with session.get(url) as response:
+                        response.raise_for_status()  # Verificar errores de respuesta
+                        async with aiofiles.open(filename, "wb") as f:
+                            while True:
+                                chunk = await response.content.read(80904)  # Tamaño de chunk aumentado
+                                if not chunk:
+                                    break
+                                await f.write(chunk)
+                    break  # Salir del bucle si la descarga es exitosa
+                except Exception as e:
+                    logger.warning(f"Attempt {attempt + 1}/{retries} failed for {url}: {e}")
+                    if attempt == retries - 1:
+                        logger.error(f"Failed to download {url} after {retries} attempts.")
+
+        logger.debug("Finished %s", url)
+
+    def download(self, callback=None):
+        self.callback = callback
         asyncio.run(self._download_urls())
 
     @property
     def files(self):
-        return [os.path.join(self.tempdir, f"{abs(hash(url))}.part") for url in self.urls]
+        if len(self._paths) != len(self.urls):
+            raise Exception("Must run DownloadPool.download() before accessing files")
+
+        return [
+            os.path.join(self.tempdir, self._paths[self.urls[i]])
+            for i in range(len(self.urls))
+        ]
 
     def __len__(self):
         return len(self.urls)
@@ -75,22 +175,50 @@ class Aria2DownloadPool:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        for file in self.files:
+        logger.debug("Removing tempfiles %s", self._paths)
+        for file in self._paths.values():
             try:
                 os.remove(file)
             except FileNotFoundError:
                 pass
 
-# Ejemplo de uso
-urls = [
-    "https://example.com/file1.zip",
-    "https://example.com/file2.zip",
-    # Añade más URLs aquí
-]
+        return False
 
-with Aria2DownloadPool(urls=urls, max_connections=32, max_cpu=4, max_ram=12*1024) as downloader:
-    downloader.download()
 
-# Obtener los archivos descargados
-files = downloader.files
-print(files)
+# Función para descargar utilizando aria2c
+def aria2c_download(urls, output_dir):
+    # Crear el comando para descargar usando aria2c
+    command = [
+        'aria2c',
+        '--max-connection-per-server=16',  # Máximo de 16 conexiones por servidor
+        '--split=16',  # Dividir la descarga en 16 partes
+        '--min-split-size=1M',  # Tamaño mínimo para cada parte
+        '--dir={}'.format(output_dir),  # Directorio de salida
+    ] + urls  # Agregar las URLs a descargar
+
+    try:
+        # Ejecutar el comando
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error downloading with aria2c: {e}")
+
+# Uso del script
+if __name__ == "__main__":
+    # Configura el directorio de descargas
+    download_directory = "/ruta/a/tu/directorio"  # Cambia esta línea
+    os.makedirs(download_directory, exist_ok=True)
+
+    # Configura el logger
+    logging.basicConfig(level=logging.DEBUG)
+
+    # Lista de URLs a descargar
+    urls = [
+        "https://www.deezer.com/mx/playlist/13111970503",
+        "https://www.deezer.com/mx/playlist/13111970783",
+        "https://www.deezer.com/mx/playlist/13111971203",
+    ]
+
+    # Llama a la función de descarga
+    aria2c_download(urls, download_directory)
+
+    print("Descargas completadas.")
