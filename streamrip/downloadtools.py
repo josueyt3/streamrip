@@ -58,15 +58,15 @@ class DownloadStream:
         if self.source == "deezer" and self.is_encrypted.search(self.url) is not None:
             assert isinstance(self.id, str), self.id
             blowfish_key = self._generate_blowfish_key(self.id)
-            CHUNK_SIZE = 8090  # Tamaño de chunk aumentado
+            CHUNK_SIZE = 9000000  # Tamaño de chunk aumentado
             return (
-                (self._decrypt_chunk(blowfish_key, chunk[:2048]) + chunk[2048:])
-                if len(chunk) >= 2048
+                (self._decrypt_chunk(blowfish_key, chunk[:9000000]) + chunk[9000000:])
+                if len(chunk) >= 9000000
                 else chunk
                 for chunk in self.request.iter_content(CHUNK_SIZE)
             )
 
-        return self.request.iter_content(chunk_size=9934)  # Aumentar tamaño de chunk
+        return self.request.iter_content(chunk_size=9000000)  # Aumentar tamaño de chunk a 1 MB
 
     @property
     def url(self):
@@ -99,7 +99,7 @@ class DownloadPool:
     def __init__(
         self,
         urls: Iterable,
-        max_connections: int = 1000,  # Aumentar número máximo de conexiones
+        max_connections: int = 8000,  # Aumentar número máximo de conexiones
         tempdir: str = None,
         chunk_callback: Optional[Callable] = None,
     ):
@@ -120,13 +120,13 @@ class DownloadPool:
         return path
 
     async def _download_urls(self):
-        connector = aiohttp.TCPConnector(limit=1000, force_close=False)
+        connector = aiohttp.TCPConnector(limit=8000, force_close=False)
         async with aiohttp.ClientSession(connector=connector) as session:
             tasks = [
-                asyncio.ensure_future(self._download_url(session, url))
+                asyncio.create_task(self._download_url(session, url))
                 for url in self.urls.values()
             ]
-            await asyncio.gather(*tasks)
+            await asyncio.wait(tasks)
 
     async def _download_url(self, session, url):
         async with self.semaphore:  # Limitar conexiones simultáneas
@@ -135,11 +135,11 @@ class DownloadPool:
             retries = 3
             for attempt in range(retries):
                 try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
                         response.raise_for_status()  # Verificar errores de respuesta
                         async with aiofiles.open(filename, "wb") as f:
                             while True:
-                                chunk = await response.content.read(512 * 1024)  # Leer en bloques más grandes
+                                chunk = await response.content.read(1048576)  # Leer en bloques de 1 MB
                                 if not chunk:
                                     break
                                 await f.write(chunk)
