@@ -16,7 +16,6 @@ from .utils import gen_threadsafe_session
 
 logger = logging.getLogger("streamrip")
 
-
 class DownloadStream:
     """An iterator over chunks of a stream."""
 
@@ -59,7 +58,7 @@ class DownloadStream:
         if self.source == "deezer" and self.is_encrypted.search(self.url) is not None:
             assert isinstance(self.id, str), self.id
             blowfish_key = self._generate_blowfish_key(self.id)
-            CHUNK_SIZE = 8090 # Tamaño de chunk aumentado
+            CHUNK_SIZE = 8090  # Tamaño de chunk aumentado
             return (
                 (self._decrypt_chunk(blowfish_key, chunk[:2048]) + chunk[2048:])
                 if len(chunk) >= 2048
@@ -100,7 +99,7 @@ class DownloadPool:
     def __init__(
         self,
         urls: Iterable,
-        max_connections: int = 600,  # Número máximo de conexiones
+        max_connections: int = 1000,  # Aumentar número máximo de conexiones
         tempdir: str = None,
         chunk_callback: Optional[Callable] = None,
     ):
@@ -121,7 +120,8 @@ class DownloadPool:
         return path
 
     async def _download_urls(self):
-        async with aiohttp.ClientSession() as session:
+        connector = aiohttp.TCPConnector(limit=1000, force_close=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
             tasks = [
                 asyncio.ensure_future(self._download_url(session, url))
                 for url in self.urls.values()
@@ -135,11 +135,11 @@ class DownloadPool:
             retries = 3
             for attempt in range(retries):
                 try:
-                    async with session.get(url) as response:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
                         response.raise_for_status()  # Verificar errores de respuesta
                         async with aiofiles.open(filename, "wb") as f:
                             while True:
-                                chunk = await response.content.read(80904)  # Tamaño de chunk aumentado
+                                chunk = await response.content.read(512 * 1024)  # Leer en bloques más grandes
                                 if not chunk:
                                     break
                                 await f.write(chunk)
