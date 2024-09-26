@@ -6,7 +6,6 @@ import os
 import re
 from tempfile import gettempdir
 from typing import Callable, Dict, Iterable, List, Optional
-import subprocess
 
 import aiofiles
 import aiohttp
@@ -60,7 +59,7 @@ class DownloadStream:
         if self.source == "deezer" and self.is_encrypted.search(self.url) is not None:
             assert isinstance(self.id, str), self.id
             blowfish_key = self._generate_blowfish_key(self.id)
-            CHUNK_SIZE = 8090  # Tamaño de chunk aumentado
+            CHUNK_SIZE = 8090 # Tamaño de chunk aumentado
             return (
                 (self._decrypt_chunk(blowfish_key, chunk[:2048]) + chunk[2048:])
                 if len(chunk) >= 2048
@@ -101,7 +100,7 @@ class DownloadPool:
     def __init__(
         self,
         urls: Iterable,
-        max_connections: int = 16,  # Limitar conexiones a un máximo de 16
+        max_connections: int = 600,  # Número máximo de conexiones
         tempdir: str = None,
         chunk_callback: Optional[Callable] = None,
     ):
@@ -115,8 +114,6 @@ class DownloadPool:
         if tempdir is None:
             tempdir = gettempdir()
         self.tempdir = tempdir
-
-        os.makedirs(self.tempdir, exist_ok=True)  # Asegúrate de que el directorio exista
 
     async def getfn(self, url):
         path = os.path.join(self.tempdir, f"__streamrip_partial_{abs(hash(url))}")
@@ -183,42 +180,3 @@ class DownloadPool:
                 pass
 
         return False
-
-
-# Función para descargar utilizando aria2c
-def aria2c_download(urls, output_dir):
-    # Crear el comando para descargar usando aria2c
-    command = [
-        'aria2c',
-        '--max-connection-per-server=16',  # Máximo de 16 conexiones por servidor
-        '--split=16',  # Dividir la descarga en 16 partes
-        '--min-split-size=1M',  # Tamaño mínimo para cada parte
-        '--dir={}'.format(output_dir),  # Directorio de salida
-    ] + urls  # Agregar las URLs a descargar
-
-    try:
-        # Ejecutar el comando
-        subprocess.run(command, check=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error downloading with aria2c: {e}")
-
-# Uso del script
-if __name__ == "__main__":
-    # Configura el directorio de descargas
-    download_directory = "/ruta/a/tu/directorio"  # Cambia esta línea
-    os.makedirs(download_directory, exist_ok=True)
-
-    # Configura el logger
-    logging.basicConfig(level=logging.DEBUG)
-
-    # Lista de URLs a descargar
-    urls = [
-        "https://www.deezer.com/mx/playlist/13111970503",
-        "https://www.deezer.com/mx/playlist/13111970783",
-        "https://www.deezer.com/mx/playlist/13111971203",
-    ]
-
-    # Llama a la función de descarga
-    aria2c_download(urls, download_directory)
-
-    print("Descargas completadas.")
