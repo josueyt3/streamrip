@@ -154,8 +154,8 @@ class DownloadPool:
         urls: Iterable,
         tempdir: str = None,
         chunk_callback: Optional[Callable] = None,
-        max_concurrent_downloads: int = 10,  # Adjustable concurrency limit
-        segment_count: int = 4,  # Number of segments to split the download into
+        max_concurrent_downloads: int = 800,  # Adjustable concurrency limit
+        segment_count: int = 400,  # Number of segments to split the download into
     ):
         self.finished: bool = False
         self.urls = dict(enumerate(urls))
