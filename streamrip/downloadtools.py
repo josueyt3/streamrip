@@ -147,21 +147,24 @@ class DownloadStream:
 
 
 class DownloadPool:
-    """Asynchronously download a set of urls."""
+    """Asynchronously download a set of URLs with high concurrency and support for segmented downloads."""
 
     def __init__(
         self,
         urls: Iterable,
         tempdir: str = None,
         chunk_callback: Optional[Callable] = None,
+        max_concurrent_downloads: int = 10,  # Adjustable concurrency limit
+        segment_count: int = 4,  # Number of segments to split the download into
     ):
         self.finished: bool = False
-        # Enumerate urls to know the order
         self.urls = dict(enumerate(urls))
         self._downloaded_urls: List[str] = []
-        # {url: path}
         self._paths: Dict[str, str] = {}
         self.task: Optional[asyncio.Task] = None
+        self.max_concurrent_downloads = max_concurrent_downloads
+        self.semaphore = asyncio.Semaphore(max_concurrent_downloads)  # Semaphore for concurrency control
+        self.segment_count = segment_count  # Number of segments for multi-threaded downloads
 
         if tempdir is None:
             tempdir = gettempdir()
@@ -175,23 +178,47 @@ class DownloadPool:
     async def _download_urls(self):
         async with aiohttp.ClientSession() as session:
             tasks = [
-                asyncio.ensure_future(self._download_url(session, url))
+                self._download_url(session, url)  # Download single files
                 for url in self.urls.values()
             ]
             await asyncio.gather(*tasks)
 
     async def _download_url(self, session, url):
+        # Call segmented download
+        await self._download_file_in_segments(session, url)
+
+    async def _download_file_in_segments(self, session, url):
         filename = await self.getfn(url)
-        logger.debug("Downloading %s", url)
-        async with session.get(url) as response, aiofiles.open(filename, "wb") as f:
-            # without aiofiles     3.6632679780000004s
-            # with    aiofiles     2.504482839s
-            await f.write(await response.content.read())
+        logger.debug("Starting segmented download for %s", url)
 
-        if self.callback:
-            self.callback()
+        async with session.head(url) as response:
+            response.raise_for_status()
+            file_size = int(response.headers.get("Content-Length", 0))
 
-        logger.debug("Finished %s", url)
+        # Calculate the size of each segment
+        segment_size = file_size // self.segment_count
+
+        # Create tasks for each segment download
+        tasks = [
+            self._download_segment(session, url, filename, i * segment_size, 
+                                   segment_size if i < self.segment_count - 1 else None)
+            for i in range(self.segment_count)
+        ]
+        await asyncio.gather(*tasks)
+        logger.debug("Completed segmented download for %s", url)
+
+    async def _download_segment(self, session, url, filename, start, size):
+        async with self.semaphore:
+            headers = {'Range': f'bytes={start}-{(start + size - 1) if size is not None else ""}'}
+            logger.debug("Downloading segment %d from %s", start, url)
+
+            async with session.get(url, headers=headers) as response:
+                response.raise_for_status()
+                async with aiofiles.open(filename, "r+b") as f:
+                    await f.seek(start)
+                    await f.write(await response.read())
+
+            logger.debug("Finished downloading segment starting at byte %d for %s", start, url)
 
     def download(self, callback=None):
         self.callback = callback
@@ -200,7 +227,6 @@ class DownloadPool:
     @property
     def files(self):
         if len(self._paths) != len(self.urls):
-            # Not all of them have downloaded
             raise Exception("Must run DownloadPool.download() before accessing files")
 
         return [
