@@ -1,251 +1,232 @@
 import asyncio
+import base64
 import functools
 import hashlib
+import itertools
+import json
 import logging
 import os
 import re
-from tempfile import gettempdir
-from typing import Callable, Dict, Iterable, List, Optional
+import shutil
+import tempfile
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
 
 import aiofiles
 import aiohttp
-from Cryptodome.Cipher import Blowfish
+import m3u8
+from Cryptodome.Cipher import AES, Blowfish
+from Cryptodome.Util import Counter
 
-from .exceptions import NonStreamable
-from .utils import gen_threadsafe_session
+from .. import converter
+from ..exceptions import NonStreamableError
 
 logger = logging.getLogger("streamrip")
 
+BLOWFISH_SECRET = "g4el58wc0zvf9na1"
 
-class DownloadStream:
-    """An iterator over chunks of a stream.
+def generate_temp_path(url: str):
+    return os.path.join(
+        tempfile.gettempdir(),
+        f"__streamrip_{hash(url)}_{time.time()}.download",
+    )
 
-    Usage:
+async def fast_async_download(path, url, headers, callback):
+    """Fast download with larger chunks."""
+    chunk_size: int = 2**20  # 1 MB
+    counter = 0
+    yield_every = 8  # 8 MB
+    async with aiofiles.open(path, "wb") as file:
+        async with aiohttp.ClientSession().get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.content.iter_any(chunk_size):
+                await file.write(chunk)
+                callback(len(chunk))
+                if counter % yield_every == 0:
+                    await asyncio.sleep(0)
+                counter += 1
 
-        >>> stream = DownloadStream('https://google.com', None)
-        >>> with open('google.html', 'wb') as file:
-        >>>     for chunk in stream:
-        >>>         file.write(chunk)
+@dataclass(slots=True)
+class Downloadable(ABC):
+    session: aiohttp.ClientSession
+    url: str
+    extension: str
+    source: str = "Unknown"
+    _size_base: Optional[int] = None
 
-    """
+    async def download(self, path: str, callback: Callable[[int], Any]):
+        await self._download(path, callback)
 
-    is_encrypted = re.compile("/m(?:obile|edia)/")
+    async def size(self) -> int:
+        if hasattr(self, "_size") and self._size is not None:
+            return self._size
 
-    def __init__(
-        self,
-        url: str,
-        source: str = None,
-        params: dict = None,
-        headers: dict = None,
-        item_id: str = None,
-    ):
-        """Create an iterable DownloadStream of a URL.
-
-        :param url: The url to download
-        :type url: str
-        :param source: Only applicable for Deezer
-        :type source: str
-        :param params: Parameters to pass in the request
-        :type params: dict
-        :param headers: Headers to pass in the request
-        :type headers: dict
-        :param item_id: (Only for Deezer) the ID of the track
-        :type item_id: str
-        """
-        self.source = source
-        self.session = gen_threadsafe_session(headers=headers)
-
-        self.id = item_id
-        if isinstance(self.id, int):
-            self.id = str(self.id)
-
-        if params is None:
-            params = {}
-
-        self.request = self.session.get(
-            url, allow_redirects=True, stream=True, params=params
-        )
-        self.file_size = int(self.request.headers.get("Content-Length", 0))
-
-        if self.file_size < 20000 and not self.url.endswith(".jpg"):
-            import json
-
-            try:
-                info = self.request.json()
-                try:
-                    # Usually happens with deezloader downloads
-                    raise NonStreamable(f"{info['error']} - {info['message']}")
-                except KeyError:
-                    raise NonStreamable(info)
-
-            except json.JSONDecodeError:
-                raise NonStreamable("File not found.")
-
-    def __iter__(self) -> Iterable:
-        """Iterate through chunks of the stream.
-
-        :rtype: Iterable
-        """
-        if self.source == "deezer" and self.is_encrypted.search(self.url) is not None:
-            assert isinstance(self.id, str), self.id
-
-            blowfish_key = self._generate_blowfish_key(self.id)
-            # decryptor = self._create_deezer_decryptor(blowfish_key)
-            CHUNK_SIZE = 2048 * 3
-            return (
-                # (decryptor.decrypt(chunk[:2048]) + chunk[2048:])
-                (self._decrypt_chunk(blowfish_key, chunk[:2048]) + chunk[2048:])
-                if len(chunk) >= 2048
-                else chunk
-                for chunk in self.request.iter_content(CHUNK_SIZE)
-            )
-
-        return self.request.iter_content(chunk_size=1024)
+        async with self.session.head(self.url) as response:
+            response.raise_for_status()
+            content_length = response.headers.get("Content-Length", 0)
+            self._size = int(content_length)
+            return self._size
 
     @property
-    def url(self):
-        """Return the requested url."""
-        return self.request.url
+    def _size(self):
+        return self._size_base
 
-    def __len__(self) -> int:
-        """Return the value of the "Content-Length" header.
+    @_size.setter
+    def _size(self, v):
+        self._size_base = v
 
-        :rtype: int
-        """
-        return self.file_size
+    @abstractmethod
+    async def _download(self, path: str, callback: Callable[[int], None]):
+        raise NotImplementedError
 
-    def _create_deezer_decryptor(self, key) -> Blowfish:
-        return Blowfish.new(key, Blowfish.MODE_CBC, b"\x00\x01\x02\x03\x04\x05\x06\x07")
+class BasicDownloadable(Downloadable):
+    """Just downloads a URL."""
 
-    @staticmethod
-    def _generate_blowfish_key(track_id: str):
-        """Generate the blowfish key for Deezer downloads.
+    def __init__(self, session: aiohttp.ClientSession, url: str, extension: str, source: str | None = None):
+        self.session = session
+        self.url = url
+        self.extension = extension
+        self._size = None
+        self.source: str = source or "Unknown"
 
-        :param track_id:
-        :type track_id: str
-        """
-        SECRET = "g4el58wc0zvf9na1"
-        md5_hash = hashlib.md5(track_id.encode()).hexdigest()
-        # good luck :)
-        return "".join(
-            chr(functools.reduce(lambda x, y: x ^ y, map(ord, t)))
-            for t in zip(md5_hash[:16], md5_hash[16:], SECRET)
-        ).encode()
+    async def _download(self, path: str, callback):
+        await fast_async_download(path, self.url, self.session.headers, callback)
+
+class DeezerDownloadable(Downloadable):
+    is_encrypted = re.compile("/m(?:obile|edia)/")
+
+    def __init__(self, session: aiohttp.ClientSession, info: dict):
+        logger.debug("Deezer info for downloadable: %s", info)
+        self.session = session
+        self.url = info["url"]
+        self.source: str = "deezer"
+        qualities_available = [i for i, size in enumerate(info["quality_to_size"]) if size > 0]
+        if len(qualities_available) == 0:
+            raise NonStreamableError("Missing download info. Skipping.")
+        max_quality_available = max(qualities_available)
+        self.quality = min(info["quality"], max_quality_available)
+        self._size = info["quality_to_size"][self.quality]
+        self.extension = "mp3" if self.quality <= 1 else "flac"
+        self.id = str(info["id"])
+
+    async def _download(self, path: str, callback):
+        async with self.session.get(self.url, allow_redirects=True) as resp:
+            resp.raise_for_status()
+            self._size = int(resp.headers.get("Content-Length", 0))
+            if self._size < 20000 and not self.url.endswith(".jpg"):
+                try:
+                    info = await resp.json()
+                    raise NonStreamableError(f"{info['error']} - {info['message']}")
+                except json.JSONDecodeError:
+                    raise NonStreamableError("File not found.")
+
+            if self.is_encrypted.search(self.url) is None:
+                logger.debug(f"Deezer file at {self.url} not encrypted.")
+                await fast_async_download(path, self.url, self.session.headers, callback)
+            else:
+                blowfish_key = self._generate_blowfish_key(self.id)
+                logger.debug("Deezer file (id %s) at %s is encrypted. Decrypting with %s", self.id, self.url, blowfish_key)
+
+                buf = bytearray()
+                async for data in resp.content.iter_any():
+                    buf += data
+                    callback(len(data))
+
+                encrypt_chunk_size = 3 * 2048
+                async with aiofiles.open(path, "wb") as audio:
+                    buflen = len(buf)
+                    for i in range(0, buflen, encrypt_chunk_size):
+                        data = buf[i: min(i + encrypt_chunk_size, buflen)]
+                        decrypted_chunk = (
+                            self._decrypt_chunk(blowfish_key, data[:2048]) + data[2048:]
+                        ) if len(data) >= 2048 else data
+                        await audio.write(decrypted_chunk)
 
     @staticmethod
     def _decrypt_chunk(key, data):
-        """Decrypt a chunk of a Deezer stream.
+        return Blowfish.new(key, Blowfish.MODE_CBC, b"\x00\x01\x02\x03\x04\x05\x06\x07").decrypt(data)
 
-        :param key:
-        :param data:
-        """
-        return Blowfish.new(
-            key,
-            Blowfish.MODE_CBC,
-            b"\x00\x01\x02\x03\x04\x05\x06\x07",
-        ).decrypt(data)
+    @staticmethod
+    def _generate_blowfish_key(track_id: str) -> bytes:
+        md5_hash = hashlib.md5(track_id.encode()).hexdigest()
+        return "".join(
+            chr(functools.reduce(lambda x, y: x ^ y, map(ord, t)))
+            for t in zip(md5_hash[:16], md5_hash[16:], BLOWFISH_SECRET)
+        ).encode()
 
+class SoundcloudDownloadable(Downloadable):
+    def __init__(self, session, info: dict):
+        self.session = session
+        self.file_type = info["type"]
+        self.source = "soundcloud"
+        self.extension = "mp3" if self.file_type == "mp3" else "flac"
+        self.url = info["url"]
 
-class DownloadPool:
-    """Asynchronously download a set of URLs with high concurrency and support for segmented downloads."""
+    async def _download(self, path: str, callback):
+        if self.file_type == "mp3":
+            await self._download_mp3(path, callback)
+        else:
+            await self._download_original(path, callback)
 
-    def __init__(
-        self,
-        urls: Iterable,
-        tempdir: str = None,
-        chunk_callback: Optional[Callable] = None,
-        max_concurrent_downloads: int = 800,  # Adjustable concurrency limit
-        segment_count: int = 400,  # Number of segments to split the download into
-    ):
-        self.finished: bool = False
-        self.urls = dict(enumerate(urls))
-        self._downloaded_urls: List[str] = []
-        self._paths: Dict[str, str] = {}
-        self.task: Optional[asyncio.Task] = None
-        self.max_concurrent_downloads = max_concurrent_downloads
-        self.semaphore = asyncio.Semaphore(max_concurrent_downloads)  # Semaphore for concurrency control
-        self.segment_count = segment_count  # Number of segments for multi-threaded downloads
+    async def _download_original(self, path: str, callback):
+        downloader = BasicDownloadable(self.session, self.url, "flac", source="soundcloud")
+        await downloader.download(path, callback)
 
-        if tempdir is None:
-            tempdir = gettempdir()
-        self.tempdir = tempdir
+    async def _download_mp3(self, path: str, callback):
+        async with self.session.get(self.url) as resp:
+            content = await resp.text("utf-8")
+        parsed_m3u = m3u8.loads(content)
+        self._size = len(parsed_m3u.segments)
+        tasks = [asyncio.create_task(self._download_segment(segment.uri)) for segment in parsed_m3u.segments]
+        segment_paths = await asyncio.gather(*tasks)
+        await concat_audio_files(segment_paths, path, "mp3")
 
-    async def getfn(self, url):
-        path = os.path.join(self.tempdir, f"__streamrip_partial_{abs(hash(url))}")
-        self._paths[url] = path
-        return path
+async def concat_audio_files(paths: list[str], out: str, ext: str, max_files_open=128):
+    if shutil.which("ffmpeg") is None:
+        raise Exception("FFmpeg must be installed.")
+    if len(paths) == 1:
+        shutil.move(paths[0], out)
+        return
+    it = iter(paths)
+    num_batches = len(paths) // max_files_open + (1 if len(paths) % max_files_open != 0 else 0)
+    tempdir = tempfile.gettempdir()
+    outpaths = [os.path.join(tempdir, f"__streamrip_ffmpeg_{hash(paths[i*max_files_open])}.{ext}") for i in range(num_batches)]
+    for p, outpath in zip(itertools.zip_longest(*[it] * max_files_open), outpaths):
+        cmd = ["ffmpeg", "-y"]
+        for segment in p:
+            if segment:
+                cmd += ["-i", segment]
+        cmd += ["-filter_complex", f"concat=n={len(p)}:v=0:a=1", outpath]
+        subprocess.run(cmd)
+    cmd = ["ffmpeg", "-y"]
+    for outpath in outpaths:
+        cmd += ["-i", outpath]
+    cmd += ["-filter_complex", f"concat=n={len(outpaths)}:v=0:a=1", out]
+    subprocess.run(cmd)
+    for segment in paths:
+        os.remove(segment)
 
-    async def _download_urls(self):
-        async with aiohttp.ClientSession() as session:
-            tasks = [
-                self._download_url(session, url)  # Download single files
-                for url in self.urls.values()
+async def download_playlist(session: aiohttp.ClientSession, playlist_info: dict):
+    downloadables = []
+    for track_info in playlist_info["tracks"]:
+        downloadable = DeezerDownloadable(session, track_info)
+        downloadables.append(downloadable)
+
+    async with aiofiles.open("output_playlist.txt", "w") as f:
+        for downloadable in downloadables:
+            await downloadable.download(f, lambda x: logger.info(f"Downloaded {x} bytes"))
+
+async def main():
+    async with aiohttp.ClientSession() as session:
+        playlist_info = {
+            "tracks": [
+                {"url": "http://example.com/track1", "id": 1, "quality": 0, "quality_to_size": [1000, 2000]},
+                {"url": "http://example.com/track2", "id": 2, "quality": 0, "quality_to_size": [1500, 2500]},
             ]
-            await asyncio.gather(*tasks)
+        }
+        await download_playlist(session, playlist_info)
 
-    async def _download_url(self, session, url):
-        # Call segmented download
-        await self._download_file_in_segments(session, url)
-
-    async def _download_file_in_segments(self, session, url):
-        filename = await self.getfn(url)
-        logger.debug("Starting segmented download for %s", url)
-
-        async with session.head(url) as response:
-            response.raise_for_status()
-            file_size = int(response.headers.get("Content-Length", 0))
-
-        # Calculate the size of each segment
-        segment_size = file_size // self.segment_count
-
-        # Create tasks for each segment download
-        tasks = [
-            self._download_segment(session, url, filename, i * segment_size, 
-                                   segment_size if i < self.segment_count - 1 else None)
-            for i in range(self.segment_count)
-        ]
-        await asyncio.gather(*tasks)
-        logger.debug("Completed segmented download for %s", url)
-
-    async def _download_segment(self, session, url, filename, start, size):
-        async with self.semaphore:
-            headers = {'Range': f'bytes={start}-{(start + size - 1) if size is not None else ""}'}
-            logger.debug("Downloading segment %d from %s", start, url)
-
-            async with session.get(url, headers=headers) as response:
-                response.raise_for_status()
-                async with aiofiles.open(filename, "r+b") as f:
-                    await f.seek(start)
-                    await f.write(await response.read())
-
-            logger.debug("Finished downloading segment starting at byte %d for %s", start, url)
-
-    def download(self, callback=None):
-        self.callback = callback
-        asyncio.run(self._download_urls())
-
-    @property
-    def files(self):
-        if len(self._paths) != len(self.urls):
-            raise Exception("Must run DownloadPool.download() before accessing files")
-
-        return [
-            os.path.join(self.tempdir, self._paths[self.urls[i]])
-            for i in range(len(self.urls))
-        ]
-
-    def __len__(self):
-        return len(self.urls)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        logger.debug("Removing tempfiles %s", self._paths)
-        for file in self._paths.values():
-            try:
-                os.remove(file)
-            except FileNotFoundError:
-                pass
-
-        return False
+if __name__ == "__main__":
+    asyncio.run(main())
