@@ -76,8 +76,6 @@ class DownloadCommand(Command):
     )
 
     def handle(self):
-        global outdated
-        global newest_version
 
         # Use a thread so that it doesn't slow down startup
         update_check = threading.Thread(target=is_outdated, daemon=True)
